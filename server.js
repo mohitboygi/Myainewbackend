@@ -43,7 +43,7 @@ const FIRST=/\b(i am|i'm|i was|i've been|my (name|model|creator|developer|maker|
 const CLAIM=/\b(model|assistant|chatbot|trained|created|developed|built|made|powered|based on|creator|developer)\b/i;
 
 const IDENTITY=[
-  /\b(who|which company|what company)\b.{0,30}\b(made|created|built|trained|developed|owns|designed)\b.{0,20}\b(you|u)\b/i,
+  /\b(who|which company|what company|which organi[sz]ation)\b.{0,30}\b(made|make|makes|making|creat\w*|built|build\w*|train\w*|develop\w*|own\w*|design\w*|program\w*|invent\w*|behind)\b.{0,20}\b(you|u)\b/i,
   /\bwho are (you|u)\b|\bwhat are (you|u)\b|\bwhat('?s| is) your (name|model|version)\b|\bwhich (model|llm|ai)\b.{0,25}\b(are you|is this|you)\b|\bwhat (model|llm)\b.{0,25}\b(are you|is this|you)\b/i,
   /\bare (you|u)\b.{0,20}\b(chat\s?gpt|gpt|openai|claude|gemini|llama|mistral|grok|deepseek|qwen|bard|copilot)\b/i,
   /\b(your|ur)\b.{0,12}\b(creator|developer|maker|company|owner)\b/i,
