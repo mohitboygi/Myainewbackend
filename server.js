@@ -43,18 +43,20 @@ const FIRST=/\b(i am|i'm|i was|i've been|my (name|model|creator|developer|maker|
 const CLAIM=/\b(model|assistant|chatbot|trained|created|developed|built|made|powered|based on|creator|developer)\b/i;
 
 const IDENTITY=[
-  /\b(who|which company|what company|which organi[sz]ation)\b.{0,30}\b(made|make|makes|making|creat\w*|built|build\w*|train\w*|develop\w*|own\w*|design\w*|program\w*|invent\w*|behind)\b.{0,20}\b(you|u)\b/i,
-  /\bwho are (you|u)\b|\bwhat are (you|u)\b|\bwhat('?s| is) your (name|model|version)\b|\bwhich (model|llm|ai)\b.{0,25}\b(are you|is this|you)\b|\bwhat (model|llm)\b.{0,25}\b(are you|is this|you)\b/i,
-  /\bare (you|u)\b.{0,20}\b(chat\s?gpt|gpt|openai|claude|gemini|llama|mistral|grok|deepseek|qwen|bard|copilot)\b/i,
-  /\b(your|ur)\b.{0,12}\b(creator|developer|maker|company|owner)\b/i,
-  /kisne\s+(banaya|bnaya|banai|develop|train)|(tum|tu|aap|tumhe|tujhe|apko|aapko)\b.{0,20}\b(kisne|kon|kaun|kaunsa|konsa)\b|(tera|tumhara|aapka|tmhara)\b.{0,12}\b(naam|name|model|company|creator)\b|kaun\s+(ho|hai|hain)\s*(tum|tu|aap)?|तुम्?हे?\s*किसने|तुम\s*कौन|आप\s*कौन|किसने\s*बनाया/i
+  /\b(who|which company|what company|which organi[sz]ation)\b.{0,30}\b(made|make|makes|making|creat\w*|built|build\w*|train\w*|develop\w*|own\w*|design\w*|program\w*|invent\w*|behind)\b.{0,20}\b(you|u|this|it|the (ai|model|bot|app|assistant))\b/i,
+  /\bwho are (you|u)\b|\bwhat are (you|u)\b|\bwhat('?s| is) your (name|model|version|architecture)\b|\b(introduce|tell me about) (yourself|urself)\b/i,
+  /\b(which|what)\b.{0,20}\b(model|llm|ai|gpt|engine|architecture|version|company)\b.{0,25}\b(are you|are u|is this|is it|you use|you are|do you use|powering|behind)\b/i,
+  /\b(are|r) (you|u)\b.{0,30}\b(chat\s?gpt|gpt|openai|claude|gemini|llama|mistral|grok|deepseek|qwen|bard|copilot|meta|google|anthropic|groq)\b/i,
+  /\b(are|r) (you|u)\b.{0,25}\b(built|based|powered|running|trained)\b/i,
+  /\b(your|ur)\b.{0,12}\b(creator|developer|maker|company|owner|founder)\b/i,
+  /kis\s*ne\s+(banaya|bnaya|banai|develop|train|bnai)|kisne\s+(banaya|bnaya|banai|develop|train|bnai)|(tum|tu|aap|tumhe|tujhe|apko|aapko)\b.{0,20}\b(kisne|kon|kaun|kaunsa|konsa)\b|(tera|tumhara|aapka|tmhara)\b.{0,12}\b(naam|name|model|company|creator|owner|malik|developer)\b|kaun\s+(ho|hai|hain)\s*(tum|tu|aap)?|(kaun|kon|kaunsa|konsa)\s*(sa\s*)?(model|ai|company)\b|kis\s*(company|ka\s+(model|ai))\b|(tum|tu|aap)\b.{0,15}\b(chat\s?gpt|gpt|llama|claude|gemini|mistral)\b.{0,10}\b(ho|hai|hain)\b|तुम्?हे?\s*किसने|तुम\s*कौन|आप\s*कौन|किस\s*ने|किसने|कौन\s*सा\s*मॉडल/i
 ];
-const HINGLISH=/[\u0900-\u097F]|kisne|kaun|konsa|kaunsa|tum|tu\b|tera|tumhara|aap|banaya|naam|tujhe|tumhe/i;
+const HINGLISH=/[\u0900-\u097F]|kisne|kis\s*ne|\bkis\b|kaun|kon\b|konsa|kaunsa|\btum\b|\btu\b|tera|tumhara|aap|banaya|naam|tujhe|tumhe|\bkya\b|\bho\b|\bhai\b|malik/i;
 
 /* Returns a ready reply for short identity questions, otherwise null (no model call needed) */
 function identityReply(text){
   const t=String(text||"").trim();
-  if(!t||t.length>160||!IDENTITY.some(r=>r.test(t)))return null;
+  if(!t||t.length>200||!IDENTITY.some(r=>r.test(t)))return null;
   return HINGLISH.test(t)?"Main Mohit AI hoon, Mohit Corporation ka model.":"I'm Mohit AI, a model by Mohit Corporation.";
 }
 
@@ -139,7 +141,7 @@ const ORDER=E.ROUTE_ORDER||"custom,groq,mistral,sambanova,tokenin,bynara";
 const TIERS=["fast","smart","coding","reasoning","vision"];
 const SYSTEM="You are Mohit AI, a model by Mohit Corporation. If anyone asks who made you, who trained you, which model or company is behind you, or what your name is, answer only that you are Mohit AI, a model by Mohit Corporation. Never name any other company, model or provider as your creator or as what powers you.";
 const model=(p,t)=>{const U=p.toUpperCase();return E[`${U}_MODEL_${t.toUpperCase()}`]||(t==="vision"?null:E[`${U}_MODEL`])||(DEF[p]&&DEF[p][t])||null};
-const candidates=t=>(E[`ROUTE_${t.toUpperCase()}`]||ORDER).split(",").map(s=>s.trim()).filter(p=>P[p]&&model(p,t)).map(p=>[p,model(p,t)]);
+const candidates=t=>(E[`ROUTE_${t.toUpperCase()}`]||ORDER).split(",").map(s=>s.trim()).filter(p=>P[p]&&(model(p,t)||(t!=="vision"&&!DEF[p]))).map(p=>[p,model(p,t)||"@auto"]);
 console.log("[router] active providers:",Object.entries(P).map(([k,v])=>`${k}(${v.keys.length} key)`).join(", ")||"NONE");
 
 function pickTier(req,text,img){
@@ -172,7 +174,18 @@ function prepare(b){
   return{tier:pickTier(b.model,lastText,img),messages:[{role:"system",content:SYSTEM},...msgs],lastText};
 }
 
-const cool=new Map(),rr={};
+const cool=new Map(),rr={},autoCache={};
+/* Provider with no model name set (e.g. Bynara): ask its /models list once and use the first model */
+async function autoModel(p){
+  if(autoCache[p])return autoCache[p];
+  const k=pickKey(p);if(!k)return null;
+  try{
+    const r=await fetch(P[p].base+"/models",{headers:{Authorization:"Bearer "+k.key},signal:AbortSignal.timeout(8000)});
+    const j=await r.json(),x=(j.data||j.models||[])[0],m=typeof x==="string"?x:x&&(x.id||x.name);
+    if(m)autoCache[p]=m;else console.warn(`[router] ${p}: no models found, set ${p.toUpperCase()}_MODEL`);
+    return m||null;
+  }catch(e){console.warn(`[router] ${p}: couldn't list models (${e.message}). Set ${p.toUpperCase()}_MODEL`);return null}
+}
 function pickKey(p){const ks=P[p].keys;for(let i=0;i<ks.length;i++){const x=((rr[p]||0)+i)%ks.length,id=p+":"+x;if((cool.get(id)||0)<Date.now()){rr[p]=x+1;return{key:ks[x],id}}}return null}
 async function* sse(body,info){
   const dec=new TextDecoder();let buf="";
@@ -192,7 +205,8 @@ async function* strip(it){ // hides <think>…</think> reasoning blocks
 /* Tries providers in order; fails over on 429/5xx/auth errors before the first byte is sent */
 async function* streamChat(tier,messages,signal,info={}){
   const list=candidates(tier);
-  for(const[p,mdl]of list){
+  for(const[p,m0]of list){
+    let mdl=m0;if(mdl==="@auto"){mdl=await autoModel(p);if(!mdl)continue}
     for(let a=0;a<P[p].keys.length;a++){
       const k=pickKey(p);if(!k)break;
       const ctl=new AbortController(),onAbort=()=>ctl.abort();signal.addEventListener("abort",onAbort);
