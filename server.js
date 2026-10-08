@@ -144,7 +144,6 @@ const P=Object.fromEntries(Object.entries(ALL).filter(([,v])=>v.base&&v.keys.len
 for(const[k,v]of Object.entries(ALL))if(v.keys.length&&!v.base)console.warn(`[router] ${k}: keys found but ${k.toUpperCase()}_BASE_URL is missing, so ${k} is skipped`);
 // Default model IDs change over time: check each provider's model list and override via <PROVIDER>_MODEL_<TIER> in .env
 const DEF={
-const DEF={
   groq:{fast:"openai/gpt-oss-20b",smart:"openai/gpt-oss-120b",coding:"openai/gpt-oss-120b",reasoning:"openai/gpt-oss-120b",vision:"openai/gpt-oss-120b"},
   mistral:{fast:"mistral-small-latest",smart:"mistral-large-latest",coding:"codestral-latest",reasoning:"magistral-medium-latest",vision:"pixtral-large-latest"},
   sambanova:{fast:"Meta-Llama-3.1-8B-Instruct",smart:"Meta-Llama-3.3-70B-Instruct",coding:"Meta-Llama-3.3-70B-Instruct",reasoning:"DeepSeek-R1",vision:"Llama-4-Maverick-17B-128E-Instruct"}
