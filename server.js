@@ -7,7 +7,7 @@ import rateLimit from "express-rate-limit";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import {OAuth2Client} from "google-auth-library";
-import Database from "better-sqlite3";
+import pg from "pg";
 import {parsePhoneNumberFromString} from "libphonenumber-js";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -24,18 +24,26 @@ const sha=x=>crypto.createHash("sha256").update(x).digest("hex");
 const httpErr=(status,message)=>Object.assign(new Error(message),{status});
 
 /* ================= DATABASE ================= */
-const db=new Database(process.env.DB_PATH||"./data.db");
-db.pragma("journal_mode = WAL");
-db.exec(`
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,phone TEXT UNIQUE NOT NULL,pw_hash TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS otp_sessions(phone TEXT PRIMARY KEY,logid TEXT,code_hash TEXT,expires_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_sent INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS otp_sends(phone TEXT NOT NULL,at INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS i_sends ON otp_sends(phone,at);`);
-db.exec(`
-CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,name TEXT NOT NULL,prefix TEXT NOT NULL,key_hash TEXT UNIQUE NOT NULL,created_at INTEGER NOT NULL,last_used INTEGER,revoked INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS usage(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,key_id INTEGER,at INTEGER NOT NULL,source TEXT NOT NULL,tier TEXT,provider TEXT,model TEXT,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,total_tokens INTEGER NOT NULL DEFAULT 0,estimated INTEGER NOT NULL DEFAULT 0);
-CREATE INDEX IF NOT EXISTS i_use_u ON usage(user_id,at);CREATE INDEX IF NOT EXISTS i_use_k ON usage(key_id);`);
-for(const c of["monthly_quota INTEGER","disabled INTEGER NOT NULL DEFAULT 0","email TEXT","google_id TEXT"])try{db.exec("ALTER TABLE users ADD COLUMN "+c)}catch{}
+pg.types.setTypeParser(20,v=>parseInt(v,10));   // bigint -> JS number
+pg.types.setTypeParser(1700,v=>parseFloat(v));  // numeric (SUM) -> JS number
+if(!E.DATABASE_URL){console.error("DATABASE_URL is missing. Add your PostgreSQL connection URL in Render > Environment.");process.exit(1)}
+const pool=new pg.Pool({connectionString:E.DATABASE_URL,max:10,ssl:E.DATABASE_SSL==="false"||/localhost|127\\.0\\.0\\.1/.test(E.DATABASE_URL)?false:{rejectUnauthorized:false}});
+const toPg=sql=>{let i=0;return sql.replace(/\\?/g,()=>"$"+(++i))};
+const db={prepare:sql=>({
+  get:async(...a)=>(await pool.query(toPg(sql),a)).rows[0],
+  all:async(...a)=>(await pool.query(toPg(sql),a)).rows,
+  run:async(...a)=>(await pool.query(toPg(sql),a)).rowCount})};
+try{await pool.query(`
+CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,phone TEXT UNIQUE NOT NULL,pw_hash TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,created_at BIGINT NOT NULL,monthly_quota BIGINT,disabled INTEGER NOT NULL DEFAULT 0,email TEXT,google_id TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS i_users_gid ON users(google_id) WHERE google_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS otp_sessions(phone TEXT PRIMARY KEY,logid TEXT,code_hash TEXT,expires_at BIGINT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_sent BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS otp_sends(phone TEXT NOT NULL,ts BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS i_sends ON otp_sends(phone,ts);
+CREATE TABLE IF NOT EXISTS api_keys(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,name TEXT NOT NULL,prefix TEXT NOT NULL,key_hash TEXT UNIQUE NOT NULL,created_at BIGINT NOT NULL,last_used BIGINT,revoked INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS usage_log(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,key_id BIGINT,ts BIGINT NOT NULL,source TEXT NOT NULL,tier TEXT,provider TEXT,model TEXT,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,total_tokens INTEGER NOT NULL DEFAULT 0,estimated INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS i_use_u ON usage_log(user_id,ts);
+CREATE INDEX IF NOT EXISTS i_use_k ON usage_log(key_id);`)}
+catch(e){console.error("Can't connect to the database:",e.message,"\\nCheck DATABASE_URL (and set DATABASE_SSL=false if the server says it does not support SSL).");process.exit(1)}
 
 /* ================= BRAND FILTER (always answers as Mohit AI) ================= */
 /* Brand identity filter: whoever asks, the answer is "Mohit AI, a model by Mohit Corporation" */
@@ -84,10 +92,10 @@ if(MODE==="console"&&E.NODE_ENV==="production"){MODE="off";console.warn("[otp] m
 
 async function sendOtp({e164,cc,national}){
   if(MODE==="off")throw httpErr(503,"Mobile OTP isn't available. Use Continue with Google.");
-  const now=Date.now(),s=db.prepare("SELECT * FROM otp_sessions WHERE phone=?").get(e164);
+  const now=Date.now(),s=await db.prepare("SELECT * FROM otp_sessions WHERE phone=?").get(e164);
   if(s&&now-s.last_sent<RESEND)throw httpErr(429,`Wait ${Math.ceil((RESEND-(now-s.last_sent))/1000)}s before requesting another code.`);
-  db.prepare("DELETE FROM otp_sends WHERE at<?").run(now-3600e3);
-  if(db.prepare("SELECT COUNT(*) c FROM otp_sends WHERE phone=?").get(e164).c>=PER_HOUR)throw httpErr(429,"Too many codes requested. Try again in an hour.");
+  await db.prepare("DELETE FROM otp_sends WHERE ts<?").run(now-3600e3);
+  if((await db.prepare("SELECT COUNT(*) AS c FROM otp_sends WHERE phone=?").get(e164)).c>=PER_HOUR)throw httpErr(429,"Too many codes requested. Try again in an hour.");
   let logid=null,codeHash=null;
   if(MODE==="authkey"){
     const u=new URL("https://api.authkey.io/request");
@@ -99,16 +107,16 @@ async function sendOtp({e164,cc,national}){
   }else{
     const code=String(crypto.randomInt(0,1e6)).padStart(6,"0");codeHash=sha(code);console.log(`[DEV OTP] ${e164}: ${code}`);
   }
-  db.prepare("INSERT INTO otp_sessions(phone,logid,code_hash,expires_at,attempts,last_sent) VALUES(?,?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET logid=excluded.logid,code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=0,last_sent=excluded.last_sent").run(e164,logid,codeHash,now+TTL,now);
-  db.prepare("INSERT INTO otp_sends(phone,at) VALUES(?,?)").run(e164,now);
+  await db.prepare("INSERT INTO otp_sessions(phone,logid,code_hash,expires_at,attempts,last_sent) VALUES(?,?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET logid=excluded.logid,code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=0,last_sent=excluded.last_sent").run(e164,logid,codeHash,now+TTL,now);
+  await db.prepare("INSERT INTO otp_sends(phone,ts) VALUES(?,?)").run(e164,now);
 }
 
 async function verifyOtp(e164,code){
-  const s=db.prepare("SELECT * FROM otp_sessions WHERE phone=?").get(e164),del=()=>db.prepare("DELETE FROM otp_sessions WHERE phone=?").run(e164);
+  const s=await db.prepare("SELECT * FROM otp_sessions WHERE phone=?").get(e164),del=()=>db.prepare("DELETE FROM otp_sessions WHERE phone=?").run(e164);
   if(!s)throw httpErr(400,"No active code. Request a new one.");
-  if(Date.now()>s.expires_at){del();throw httpErr(400,"Code expired. Request a new one.")}
-  if(s.attempts>=MAX_TRY){del();throw httpErr(429,"Too many wrong attempts. Request a new code.")}
-  db.prepare("UPDATE otp_sessions SET attempts=attempts+1 WHERE phone=?").run(e164);
+  if(Date.now()>s.expires_at){await del();throw httpErr(400,"Code expired. Request a new one.")}
+  if(s.attempts>=MAX_TRY){await del();throw httpErr(429,"Too many wrong attempts. Request a new code.")}
+  await db.prepare("UPDATE otp_sessions SET attempts=attempts+1 WHERE phone=?").run(e164);
   let ok=false;
   if(MODE==="authkey"){
     const u=new URL("https://console.authkey.io/restapi/2fa_verify.php");
@@ -120,7 +128,7 @@ async function verifyOtp(e164,code){
     const a=Buffer.from(sha(code)),b=Buffer.from(s.code_hash);ok=a.length===b.length&&crypto.timingSafeEqual(a,b);
   }
   if(!ok)throw httpErr(400,"That code isn't right. Check it and try again.");
-  del();
+  await del();
 }
 
 /* ================= AI ROUTER + PROVIDER KEYS (read from config.js) ================= */
@@ -252,15 +260,15 @@ auth.post("/signup",lim(3600e3,10,"Too many signups from this network. Try again
   const name=String(q.body.name||"").trim().slice(0,60),pw=String(q.body.password||""),p=phoneOf(q.body.phone);
   if(!name)throw httpErr(400,"Enter your name.");
   if(pw.length<8||pw.length>128)throw httpErr(400,"Password must be 8 to 128 characters.");
-  const u=byPhone(p.e164);
+  const u=await byPhone(p.e164);
   if(u&&u.verified)throw httpErr(409,"This number is already registered. Log in instead.");
-  db.prepare("INSERT INTO users(name,phone,pw_hash,verified,created_at) VALUES(?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET name=excluded.name,pw_hash=excluded.pw_hash WHERE users.verified=0")
+  await db.prepare("INSERT INTO users(name,phone,pw_hash,verified,created_at) VALUES(?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET name=excluded.name,pw_hash=excluded.pw_hash WHERE users.verified=0")
     .run(name,p.e164,await bcrypt.hash(pw,11),Date.now());
   s.json({});
 }));
 
 auth.post("/login",lim(15*60e3,20,"Too many login attempts. Try again in 15 minutes."),wrap(async(q,s)=>{
-  const p=phoneOf(q.body.phone),u=byPhone(p.e164);
+  const p=phoneOf(q.body.phone),u=await byPhone(p.e164);
   const ok=await bcrypt.compare(String(q.body.password||""),u?u.pw_hash:DUMMY);
   if(!u||!ok)throw httpErr(401,"Wrong mobile number or password.");
   if(u.verified&&!EVERY)return s.json({token:sign(u),name:u.name,verified:true,admin:isAdmin(u)});
@@ -268,7 +276,7 @@ auth.post("/login",lim(15*60e3,20,"Too many login attempts. Try again in 15 minu
 }));
 
 auth.post("/send-otp",lim(3600e3,15,"Too many code requests from this network. Try again later."),wrap(async(q,s)=>{
-  const p=phoneOf(q.body.phone),u=byPhone(p.e164);
+  const p=phoneOf(q.body.phone),u=await byPhone(p.e164);
   if(u&&(!u.verified||EVERY))await sendOtp(p); // unknown numbers get the same {} reply
   s.json({});
 }));
@@ -276,10 +284,10 @@ auth.post("/send-otp",lim(3600e3,15,"Too many code requests from this network. T
 auth.post("/verify-otp",lim(15*60e3,20,"Too many attempts. Try again in a few minutes."),wrap(async(q,s)=>{
   const p=phoneOf(q.body.phone),code=String(q.body.code||"");
   if(!/^\d{4,8}$/.test(code))throw httpErr(400,"Enter the 6-digit code.");
-  const u=byPhone(p.e164);
+  const u=await byPhone(p.e164);
   if(!u)throw httpErr(400,"That code isn't right. Check it and try again.");
   await verifyOtp(p.e164,code);
-  db.prepare("UPDATE users SET verified=1 WHERE id=?").run(u.id);
+  await db.prepare("UPDATE users SET verified=1 WHERE id=?").run(u.id);
   s.json({token:sign(u),name:u.name,verified:true,admin:isAdmin(u)});
 }));
 
@@ -291,26 +299,28 @@ auth.post("/google",lim(15*60e3,30,"Too many attempts. Try again in a few minute
   let p;try{p=(await gClient.verifyIdToken({idToken:String(q.body.credential||""),audience:GCID})).getPayload()}catch{throw httpErr(401,"Google sign-in failed. Try again.")}
   if(!p||!p.email||!p.email_verified)throw httpErr(401,"Your Google email isn't verified.");
   const email=p.email.toLowerCase(),get=()=>db.prepare("SELECT * FROM users WHERE google_id=? OR email=?").get(p.sub,email);
-  let u=get();
-  if(!u){db.prepare("INSERT INTO users(name,phone,pw_hash,verified,created_at,email,google_id) VALUES(?,?,?,1,?,?,?)").run(String(p.name||email.split("@")[0]).slice(0,60),"g:"+p.sub,"!",Date.now(),email,p.sub);u=get()}
-  else if(!u.google_id||!u.verified){db.prepare("UPDATE users SET google_id=?,verified=1,email=? WHERE id=?").run(p.sub,email,u.id);u=get()}
+  let u=await get();
+  if(!u){await db.prepare("INSERT INTO users(name,phone,pw_hash,verified,created_at,email,google_id) VALUES(?,?,?,1,?,?,?)").run(String(p.name||email.split("@")[0]).slice(0,60),"g:"+p.sub,"!",Date.now(),email,p.sub);u=await get()}
+  else if(!u.google_id||!u.verified){await db.prepare("UPDATE users SET google_id=?,verified=1,email=? WHERE id=?").run(p.sub,email,u.id);u=await get()}
   s.json({token:sign(u),name:u.name,email,verified:true,admin:isAdmin(u)});
 }));
 
 /* Gate for every protected route: accepts a login token OR an mc_ API key, and requires a verified phone */
 const fail=(s,st,m)=>s.status(st).json({message:m,error:{message:m,type:"mohit_error"}});
-function requireVerified(q,s,n){
+const requireVerified=(q,s,n)=>gate(q,s,n).catch(n);
+async function gate(q,s,n){
   const h=q.headers.authorization||"",t=h.startsWith("Bearer ")?h.slice(7).trim():"";
   if(t.startsWith("mc_")){
-    const k=db.prepare("SELECT k.id kid,k.revoked,u.id,u.phone,u.email,u.verified,u.disabled FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=?").get(sha(t));
+    const k=await db.prepare("SELECT k.id AS kid,k.revoked,u.id,u.phone,u.email,u.verified,u.disabled FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=?").get(sha(t));
     if(!k||k.revoked)return fail(s,401,"Invalid API key.");
     if(!k.verified)return fail(s,403,"Verify your mobile number to use the API.");
     if(k.disabled)return fail(s,403,"This account is disabled.");
-    db.prepare("UPDATE api_keys SET last_used=? WHERE id=?").run(Date.now(),k.kid);
+    await db.prepare("UPDATE api_keys SET last_used=? WHERE id=?").run(Date.now(),k.kid);
     q.user={id:k.id,phone:k.phone,email:k.email,keyId:k.kid,via:"key"};return n();
   }
-  let u;
-  try{u=db.prepare("SELECT id,phone,email,verified,disabled FROM users WHERE id=?").get(jwt.verify(t,SECRET,{algorithms:["HS256"]}).sub)}catch{return fail(s,401,"Please log in again.")}
+  let uid;
+  try{uid=jwt.verify(t,SECRET,{algorithms:["HS256"]}).sub}catch{return fail(s,401,"Please log in again.")}
+  const u=await db.prepare("SELECT id,phone,email,verified,disabled FROM users WHERE id=?").get(uid);
   if(!u||!u.verified)return fail(s,403,"Verify your mobile number to continue.");
   if(u.disabled)return fail(s,403,"This account is disabled.");
   q.user={id:u.id,phone:u.phone,email:u.email,keyId:null,via:"jwt"};n();
@@ -321,61 +331,61 @@ const requireAdmin=(q,s,n)=>requireJwt(q,s,()=>isAdmin(q.user)?n():fail(s,403,"A
 /* ================= API KEYS, USAGE, ADMIN ================= */
 const DEF_Q=+(process.env.DEFAULT_MONTHLY_TOKENS||1000000); // 0 = unlimited
 const monthStart=()=>{const d=new Date();return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),1)};
-const sum=(id,since)=>db.prepare("SELECT COALESCE(SUM(total_tokens),0) tokens,COUNT(*) requests FROM usage WHERE user_id=? AND at>=?").get(id,since);
-const quotaOf=id=>{const u=db.prepare("SELECT monthly_quota q FROM users WHERE id=?").get(id);return u&&u.q!=null?u.q:DEF_Q};
+const sum=(id,since)=>db.prepare("SELECT COALESCE(SUM(total_tokens),0) AS tokens,COUNT(*) AS requests FROM usage_log WHERE user_id=? AND ts>=?").get(id,since);
+const quotaOf=async id=>{const u=await db.prepare("SELECT monthly_quota AS q FROM users WHERE id=?").get(id);return u&&u.q!=null?u.q:DEF_Q};
 
-function checkQuota(id){const q=quotaOf(id);if(q>0&&sum(id,monthStart()).tokens>=q)throw httpErr(429,"Monthly token limit reached. Contact Mohit Corporation to raise it.")}
+async function checkQuota(id){const q=await quotaOf(id);if(q>0&&(await sum(id,monthStart())).tokens>=q)throw httpErr(429,"Monthly token limit reached. Contact Mohit Corporation to raise it.")}
 const charsOf=ms=>ms.reduce((a,m)=>a+(typeof m.content==="string"?m.content.length:m.content.reduce((b,p)=>b+(p.type==="text"?p.text.length:3000),0)),0);
 /* Uses the token counts reported by the upstream model; if none are reported, estimates ~4 chars per token (estimated=1) */
-function recordUsage({userId,keyId,source,tier,info,promptChars,outChars}){
+async function recordUsage({userId,keyId,source,tier,info,promptChars,outChars}){
   const u=info.usage||{};let pt=+u.prompt_tokens||0,ct=+u.completion_tokens||0,est=0;
   if(!pt&&!ct){pt=Math.ceil(promptChars/4);ct=Math.ceil(outChars/4);est=1}
-  db.prepare("INSERT INTO usage(user_id,key_id,at,source,tier,provider,model,prompt_tokens,completion_tokens,total_tokens,estimated) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+  await db.prepare("INSERT INTO usage_log(user_id,key_id,ts,source,tier,provider,model,prompt_tokens,completion_tokens,total_tokens,estimated) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
     .run(userId,keyId||null,Date.now(),source,tier,info.provider||null,info.model||null,pt,ct,pt+ct,est);
   return{prompt_tokens:pt,completion_tokens:ct,total_tokens:pt+ct};
 }
-function usageFor(id,days){
+async function usageFor(id,days){
   const since=Date.now()-Math.min(Math.max(+days||30,1),90)*864e5;
   return{
-    days:db.prepare("SELECT strftime('%Y-%m-%d',at/1000,'unixepoch') d,SUM(total_tokens) tokens,COUNT(*) requests FROM usage WHERE user_id=? AND at>=? GROUP BY d ORDER BY d").all(id,since),
-    keys:db.prepare("SELECT COALESCE(k.name,'Web chat') name,SUM(g.total_tokens) tokens,COUNT(*) requests FROM usage g LEFT JOIN api_keys k ON k.id=g.key_id WHERE g.user_id=? AND g.at>=? GROUP BY g.key_id").all(id,since),
-    month_tokens:sum(id,monthStart()).tokens,quota:quotaOf(id)};
+    days:await db.prepare("SELECT to_char(to_timestamp(ts/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD') AS d,SUM(total_tokens) AS tokens,COUNT(*) AS requests FROM usage_log WHERE user_id=? AND ts>=? GROUP BY 1 ORDER BY 1").all(id,since),
+    keys:await db.prepare("SELECT COALESCE(k.name,'Web chat') AS name,SUM(g.total_tokens) AS tokens,COUNT(*) AS requests FROM usage_log g LEFT JOIN api_keys k ON k.id=g.key_id WHERE g.user_id=? AND g.ts>=? GROUP BY g.key_id,k.name").all(id,since),
+    month_tokens:(await sum(id,monthStart())).tokens,quota:await quotaOf(id)};
 }
 
 const api=Router();
 api.get("/me",requireJwt,wrap(async(q,s)=>{
-  const u=db.prepare("SELECT name,phone,email FROM users WHERE id=?").get(q.user.id);
-  s.json({name:u.name,phone:u.phone,admin:isAdmin(u),month_tokens:sum(q.user.id,monthStart()).tokens,quota:quotaOf(q.user.id)});
+  const u=await db.prepare("SELECT name,phone,email FROM users WHERE id=?").get(q.user.id);
+  s.json({name:u.name,phone:u.phone,admin:isAdmin(u),month_tokens:(await sum(q.user.id,monthStart())).tokens,quota:await quotaOf(q.user.id)});
 }));
-api.get("/me/usage",requireJwt,wrap(async(q,s)=>s.json(usageFor(q.user.id,q.query.days))));
+api.get("/me/usage",requireJwt,wrap(async(q,s)=>s.json(await usageFor(q.user.id,q.query.days))));
 
-api.get("/keys",requireJwt,wrap(async(q,s)=>s.json({keys:db.prepare("SELECT k.id,k.name,k.prefix,k.created_at,k.last_used,COALESCE((SELECT SUM(total_tokens) FROM usage WHERE key_id=k.id),0) tokens FROM api_keys k WHERE k.user_id=? AND k.revoked=0 ORDER BY k.id DESC").all(q.user.id)})));
+api.get("/keys",requireJwt,wrap(async(q,s)=>s.json({keys:await db.prepare("SELECT k.id,k.name,k.prefix,k.created_at,k.last_used,COALESCE((SELECT SUM(total_tokens) FROM usage_log WHERE key_id=k.id),0) AS tokens FROM api_keys k WHERE k.user_id=? AND k.revoked=0 ORDER BY k.id DESC").all(q.user.id)})));
 api.post("/keys",requireJwt,wrap(async(q,s)=>{
   const name=String(q.body.name||"").trim().slice(0,40)||"My app";
-  if(db.prepare("SELECT COUNT(*) c FROM api_keys WHERE user_id=? AND revoked=0").get(q.user.id).c>=10)throw httpErr(400,"You can have up to 10 active keys. Revoke one first.");
+  if((await db.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE user_id=? AND revoked=0").get(q.user.id)).c>=10)throw httpErr(400,"You can have up to 10 active keys. Revoke one first.");
   const key="mc_"+crypto.randomBytes(24).toString("base64url"); // shown once, only the hash is stored
-  const r=db.prepare("INSERT INTO api_keys(user_id,name,prefix,key_hash,created_at) VALUES(?,?,?,?,?)").run(q.user.id,name,key.slice(0,8),sha(key),Date.now());
-  s.json({id:Number(r.lastInsertRowid),name,prefix:key.slice(0,8),key});
+  const r=await db.prepare("INSERT INTO api_keys(user_id,name,prefix,key_hash,created_at) VALUES(?,?,?,?,?) RETURNING id").get(q.user.id,name,key.slice(0,8),sha(key),Date.now());
+  s.json({id:r.id,name,prefix:key.slice(0,8),key});
 }));
 api.delete("/keys/:id",requireJwt,wrap(async(q,s)=>{
-  db.prepare("UPDATE api_keys SET revoked=1 WHERE id=? AND user_id=?").run(+q.params.id,q.user.id);s.json({});
+  await db.prepare("UPDATE api_keys SET revoked=1 WHERE id=? AND user_id=?").run(+q.params.id,q.user.id);s.json({});
 }));
 
 /* ---- Admin: who used how many tokens ---- */
 api.get("/admin/users",requireAdmin,wrap(async(q,s)=>{
   const since=Date.now()-Math.min(Math.max(+q.query.days||30,1),90)*864e5;
-  const users=db.prepare(`SELECT u.id,u.name,u.phone,u.verified,u.disabled,u.monthly_quota,u.created_at,COALESCE(SUM(g.total_tokens),0) tokens,COUNT(g.id) requests,MAX(g.at) last_active,
-    (SELECT COUNT(*) FROM api_keys k WHERE k.user_id=u.id AND k.revoked=0) keys
-    FROM users u LEFT JOIN usage g ON g.user_id=u.id AND g.at>=? GROUP BY u.id ORDER BY tokens DESC LIMIT 500`).all(since);
+  const users=await db.prepare(`SELECT u.id,u.name,u.phone,u.verified,u.disabled,u.monthly_quota,u.created_at,COALESCE(SUM(g.total_tokens),0) AS tokens,COUNT(g.id) AS requests,MAX(g.ts) AS last_active,
+    (SELECT COUNT(*) FROM api_keys k WHERE k.user_id=u.id AND k.revoked=0) AS keys
+    FROM users u LEFT JOIN usage_log g ON g.user_id=u.id AND g.ts>=? GROUP BY u.id ORDER BY tokens DESC LIMIT 500`).all(since);
   s.json({users,default_quota:DEF_Q});
 }));
-api.get("/admin/users/:id/usage",requireAdmin,wrap(async(q,s)=>s.json(usageFor(+q.params.id,q.query.days))));
+api.get("/admin/users/:id/usage",requireAdmin,wrap(async(q,s)=>s.json(await usageFor(+q.params.id,q.query.days))));
 api.post("/admin/users/:id/quota",requireAdmin,wrap(async(q,s)=>{
   const v=q.body.monthly_tokens;
-  db.prepare("UPDATE users SET monthly_quota=? WHERE id=?").run(v==null?null:Math.max(0,Math.floor(+v||0)),+q.params.id);s.json({});
+  await db.prepare("UPDATE users SET monthly_quota=? WHERE id=?").run(v==null?null:Math.max(0,Math.floor(+v||0)),+q.params.id);s.json({});
 }));
 api.post("/admin/users/:id/disable",requireAdmin,wrap(async(q,s)=>{
-  db.prepare("UPDATE users SET disabled=? WHERE id=?").run(q.body.disabled?1:0,+q.params.id);s.json({});
+  await db.prepare("UPDATE users SET disabled=? WHERE id=?").run(q.body.disabled?1:0,+q.params.id);s.json({});
 }));
 
 /* ================= SERVER + ROUTES ================= */
@@ -393,13 +403,16 @@ app.use("/api/auth",auth);
 app.use("/api",api); // /me, /keys, /admin/*
 
 const chatLimit=rateLimit({windowMs:60e3,limit:+(process.env.CHAT_PER_MIN||20),standardHeaders:true,legacyHeaders:false,keyGenerator:q=>"u"+q.user.id,handler:(q,s)=>s.status(429).json({message:"You're sending messages too fast. Wait a moment.",error:{message:"Rate limit reached. Wait a moment.",type:"rate_limit"}})});
-const record=(q,tier,messages,info,out)=>recordUsage({userId:q.user.id,keyId:q.user.keyId,source:q.user.via==="key"?"api":"web",tier,info,promptChars:charsOf(messages),outChars:out});
+const record=async(q,tier,messages,info,out)=>{
+  try{return await recordUsage({userId:q.user.id,keyId:q.user.keyId,source:q.user.via==="key"?"api":"web",tier,info,promptChars:charsOf(messages),outChars:out})}
+  catch(e){console.error("[usage] couldn't save:",e.message);return{prompt_tokens:0,completion_tokens:0,total_tokens:0}}
+};
 
 /* Web app: plain text stream */
 app.post("/api/chat",requireVerified,chatLimit,wrap(async(q,s)=>{
   const{tier,messages,lastText}=prepare(q.body),quick=identityReply(lastText);
   if(quick)return s.status(200).type("text/plain; charset=utf-8").send(quick);
-  checkQuota(q.user.id);
+  await checkQuota(q.user.id);
   const ctl=new AbortController(),info={max:+q.body.max_tokens||0};s.on("close",()=>ctl.abort());
   let started=false,out=0;
   try{
@@ -409,14 +422,14 @@ app.post("/api/chat",requireVerified,chatLimit,wrap(async(q,s)=>{
     }
   }catch(e){if(!started)throw e;console.error("[chat] stream cut:",e.message)}
   if(!started)throw httpErr(502,"No response received. Try again.");
-  record(q,tier,messages,info,out);s.end();
+  await record(q,tier,messages,info,out);s.end();
 }));
 
 /* Public API for users' own apps (OpenAI-compatible). Auth: Authorization: Bearer mc_... */
 app.get("/v1/models",requireVerified,(q,s)=>s.json({object:"list",data:["auto","fast","smart","coding","reasoning","vision"].map(t=>({id:"mohit-"+t,object:"model",owned_by:"Mohit Corporation"}))}));
 app.post("/v1/chat/completions",requireVerified,chatLimit,wrap(async(q,s)=>{
   const{tier,messages,lastText}=prepare(q.body),quick=identityReply(lastText);
-  if(!quick)checkQuota(q.user.id);
+  if(!quick)await checkQuota(q.user.id);
   const ctl=new AbortController(),info={max:+q.body.max_tokens||0},stream=q.body.stream===true,id="chatcmpl-"+crypto.randomUUID(),created=Math.floor(Date.now()/1e3);
   s.on("close",()=>ctl.abort());
   const chunk=(delta,fin,usage)=>"data: "+JSON.stringify({id,object:"chat.completion.chunk",created,model:"mohit-ai",choices:[{index:0,delta,finish_reason:fin}],...(usage?{usage}:{})})+"\n\n";
@@ -429,7 +442,7 @@ app.post("/v1/chat/completions",requireVerified,chatLimit,wrap(async(q,s)=>{
     }
   }catch(e){if(!started)throw e;console.error("[v1] stream cut:",e.message)}
   if(!started)throw httpErr(502,"No response received. Try again.");
-  const usage=quick?{prompt_tokens:0,completion_tokens:0,total_tokens:0}:record(q,tier,messages,info,text.length);
+  const usage=quick?{prompt_tokens:0,completion_tokens:0,total_tokens:0}:await record(q,tier,messages,info,text.length);
   if(stream){s.write(chunk({},"stop",usage));s.write("data: [DONE]\n\n");return s.end()}
   s.json({id,object:"chat.completion",created,model:"mohit-ai",choices:[{index:0,message:{role:"assistant",content:text},finish_reason:"stop"}],usage});
 }));
