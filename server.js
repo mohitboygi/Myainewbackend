@@ -28,7 +28,7 @@ pg.types.setTypeParser(20,v=>parseInt(v,10));   // bigint -> JS number
 pg.types.setTypeParser(1700,v=>parseFloat(v));  // numeric (SUM) -> JS number
 if(!E.DATABASE_URL){console.error("DATABASE_URL is missing. Add your PostgreSQL connection URL in Render > Environment.");process.exit(1)}
 const pool=new pg.Pool({connectionString:E.DATABASE_URL,max:10,ssl:E.DATABASE_SSL==="false"||/localhost|127\\.0\\.0\\.1/.test(E.DATABASE_URL)?false:{rejectUnauthorized:false}});
-const toPg=sql=>{let i=0;return sql.replace(/\\?/g,()=>"$"+(++i))};
+const toPg=sql=>{let i=0;return sql.replace(/\?/g,()=>"$"+(++i))};
 const db={prepare:sql=>({
   get:async(...a)=>(await pool.query(toPg(sql),a)).rows[0],
   all:async(...a)=>(await pool.query(toPg(sql),a)).rows,
