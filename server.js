@@ -34,16 +34,16 @@ const db={prepare:sql=>({
   all:async(...a)=>(await pool.query(toPg(sql),a)).rows,
   run:async(...a)=>(await pool.query(toPg(sql),a)).rowCount})};
 try{await pool.query(`
-CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,phone TEXT UNIQUE NOT NULL,pw_hash TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,created_at BIGINT NOT NULL,monthly_quota BIGINT,disabled INTEGER NOT NULL DEFAULT 0,email TEXT,google_id TEXT);
-CREATE UNIQUE INDEX IF NOT EXISTS i_users_gid ON users(google_id) WHERE google_id IS NOT NULL;
-CREATE TABLE IF NOT EXISTS otp_sessions(phone TEXT PRIMARY KEY,logid TEXT,code_hash TEXT,expires_at BIGINT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_sent BIGINT NOT NULL);
-CREATE TABLE IF NOT EXISTS otp_sends(phone TEXT NOT NULL,ts BIGINT NOT NULL);
-CREATE INDEX IF NOT EXISTS i_sends ON otp_sends(phone,ts);
-CREATE TABLE IF NOT EXISTS api_keys(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,name TEXT NOT NULL,prefix TEXT NOT NULL,key_hash TEXT UNIQUE NOT NULL,created_at BIGINT NOT NULL,last_used BIGINT,revoked INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS usage_log(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,key_id BIGINT,ts BIGINT NOT NULL,source TEXT NOT NULL,tier TEXT,provider TEXT,model TEXT,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,total_tokens INTEGER NOT NULL DEFAULT 0,estimated INTEGER NOT NULL DEFAULT 0);
-CREATE INDEX IF NOT EXISTS i_use_u ON usage_log(user_id,ts);
-CREATE INDEX IF NOT EXISTS i_use_k ON usage_log(key_id);`)}
-catch(e){console.error("Can't connect to the database:",e.message,"\\nCheck DATABASE_URL (and set DATABASE_SSL=false if the server says it does not support SSL).");process.exit(1)}
+CREATE TABLE IF NOT EXISTS mc_users(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,phone TEXT UNIQUE NOT NULL,pw_hash TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,created_at BIGINT NOT NULL,monthly_quota BIGINT,disabled INTEGER NOT NULL DEFAULT 0,email TEXT,google_id TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS mc_i_gid ON mc_users(google_id) WHERE google_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS mc_otp_sessions(phone TEXT PRIMARY KEY,logid TEXT,code_hash TEXT,expires_at BIGINT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,last_sent BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS mc_otp_sends(phone TEXT NOT NULL,ts BIGINT NOT NULL);
+CREATE INDEX IF NOT EXISTS mc_i_sends ON mc_otp_sends(phone,ts);
+CREATE TABLE IF NOT EXISTS mc_api_keys(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,name TEXT NOT NULL,prefix TEXT NOT NULL,key_hash TEXT UNIQUE NOT NULL,created_at BIGINT NOT NULL,last_used BIGINT,revoked INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS mc_usage_log(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL,key_id BIGINT,ts BIGINT NOT NULL,source TEXT NOT NULL,tier TEXT,provider TEXT,model TEXT,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,total_tokens INTEGER NOT NULL DEFAULT 0,estimated INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS mc_i_use_u ON mc_usage_log(user_id,ts);
+CREATE INDEX IF NOT EXISTS mc_i_use_k ON mc_usage_log(key_id);`)}
+catch(e){console.error("Can't connect to the database:",e.message,"\nCheck DATABASE_URL (and set DATABASE_SSL=false if the server says it does not support SSL).");process.exit(1)}
 
 /* ================= BRAND FILTER (always answers as Mohit AI) ================= */
 /* Brand identity filter: whoever asks, the answer is "Mohit AI, a model by Mohit Corporation" */
@@ -92,10 +92,10 @@ if(MODE==="console"&&E.NODE_ENV==="production"){MODE="off";console.warn("[otp] m
 
 async function sendOtp({e164,cc,national}){
   if(MODE==="off")throw httpErr(503,"Mobile OTP isn't available. Use Continue with Google.");
-  const now=Date.now(),s=await db.prepare("SELECT * FROM otp_sessions WHERE phone=?").get(e164);
+  const now=Date.now(),s=await db.prepare("SELECT * FROM mc_otp_sessions WHERE phone=?").get(e164);
   if(s&&now-s.last_sent<RESEND)throw httpErr(429,`Wait ${Math.ceil((RESEND-(now-s.last_sent))/1000)}s before requesting another code.`);
-  await db.prepare("DELETE FROM otp_sends WHERE ts<?").run(now-3600e3);
-  if((await db.prepare("SELECT COUNT(*) AS c FROM otp_sends WHERE phone=?").get(e164)).c>=PER_HOUR)throw httpErr(429,"Too many codes requested. Try again in an hour.");
+  await db.prepare("DELETE FROM mc_otp_sends WHERE ts<?").run(now-3600e3);
+  if((await db.prepare("SELECT COUNT(*) AS c FROM mc_otp_sends WHERE phone=?").get(e164)).c>=PER_HOUR)throw httpErr(429,"Too many codes requested. Try again in an hour.");
   let logid=null,codeHash=null;
   if(MODE==="authkey"){
     const u=new URL("https://api.authkey.io/request");
@@ -107,16 +107,16 @@ async function sendOtp({e164,cc,national}){
   }else{
     const code=String(crypto.randomInt(0,1e6)).padStart(6,"0");codeHash=sha(code);console.log(`[DEV OTP] ${e164}: ${code}`);
   }
-  await db.prepare("INSERT INTO otp_sessions(phone,logid,code_hash,expires_at,attempts,last_sent) VALUES(?,?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET logid=excluded.logid,code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=0,last_sent=excluded.last_sent").run(e164,logid,codeHash,now+TTL,now);
-  await db.prepare("INSERT INTO otp_sends(phone,ts) VALUES(?,?)").run(e164,now);
+  await db.prepare("INSERT INTO mc_otp_sessions(phone,logid,code_hash,expires_at,attempts,last_sent) VALUES(?,?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET logid=excluded.logid,code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=0,last_sent=excluded.last_sent").run(e164,logid,codeHash,now+TTL,now);
+  await db.prepare("INSERT INTO mc_otp_sends(phone,ts) VALUES(?,?)").run(e164,now);
 }
 
 async function verifyOtp(e164,code){
-  const s=await db.prepare("SELECT * FROM otp_sessions WHERE phone=?").get(e164),del=()=>db.prepare("DELETE FROM otp_sessions WHERE phone=?").run(e164);
+  const s=await db.prepare("SELECT * FROM mc_otp_sessions WHERE phone=?").get(e164),del=()=>db.prepare("DELETE FROM mc_otp_sessions WHERE phone=?").run(e164);
   if(!s)throw httpErr(400,"No active code. Request a new one.");
   if(Date.now()>s.expires_at){await del();throw httpErr(400,"Code expired. Request a new one.")}
   if(s.attempts>=MAX_TRY){await del();throw httpErr(429,"Too many wrong attempts. Request a new code.")}
-  await db.prepare("UPDATE otp_sessions SET attempts=attempts+1 WHERE phone=?").run(e164);
+  await db.prepare("UPDATE mc_otp_sessions SET attempts=attempts+1 WHERE phone=?").run(e164);
   let ok=false;
   if(MODE==="authkey"){
     const u=new URL("https://console.authkey.io/restapi/2fa_verify.php");
@@ -247,7 +247,7 @@ const GCID=process.env.GOOGLE_CLIENT_ID||"",gClient=new OAuth2Client();
 const lim=(windowMs,limit,message)=>rateLimit({windowMs,limit,standardHeaders:true,legacyHeaders:false,handler:(q,s)=>s.status(429).json({message})});
 const DUMMY=bcrypt.hashSync("not-a-real-password",10);
 const sign=u=>jwt.sign({sub:u.id,ver:1},SECRET,{expiresIn:"7d",algorithm:"HS256"});
-const byPhone=p=>db.prepare("SELECT * FROM users WHERE phone=?").get(p);
+const byPhone=p=>db.prepare("SELECT * FROM mc_users WHERE phone=?").get(p);
 function phoneOf(raw){
   const p=parsePhoneNumberFromString(String(raw||"").replace(/[\s()-]/g,""),process.env.DEFAULT_COUNTRY||"IN");
   if(!p||!p.isValid())throw httpErr(400,"Enter a valid mobile number with country code, like +91 98765 43210.");
@@ -262,7 +262,7 @@ auth.post("/signup",lim(3600e3,10,"Too many signups from this network. Try again
   if(pw.length<8||pw.length>128)throw httpErr(400,"Password must be 8 to 128 characters.");
   const u=await byPhone(p.e164);
   if(u&&u.verified)throw httpErr(409,"This number is already registered. Log in instead.");
-  await db.prepare("INSERT INTO users(name,phone,pw_hash,verified,created_at) VALUES(?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET name=excluded.name,pw_hash=excluded.pw_hash WHERE users.verified=0")
+  await db.prepare("INSERT INTO mc_users(name,phone,pw_hash,verified,created_at) VALUES(?,?,?,0,?) ON CONFLICT(phone) DO UPDATE SET name=excluded.name,pw_hash=excluded.pw_hash WHERE mc_users.verified=0")
     .run(name,p.e164,await bcrypt.hash(pw,11),Date.now());
   s.json({});
 }));
@@ -287,7 +287,7 @@ auth.post("/verify-otp",lim(15*60e3,20,"Too many attempts. Try again in a few mi
   const u=await byPhone(p.e164);
   if(!u)throw httpErr(400,"That code isn't right. Check it and try again.");
   await verifyOtp(p.e164,code);
-  await db.prepare("UPDATE users SET verified=1 WHERE id=?").run(u.id);
+  await db.prepare("UPDATE mc_users SET verified=1 WHERE id=?").run(u.id);
   s.json({token:sign(u),name:u.name,verified:true,admin:isAdmin(u)});
 }));
 
@@ -298,10 +298,10 @@ auth.post("/google",lim(15*60e3,30,"Too many attempts. Try again in a few minute
   if(!GCID)throw httpErr(503,"Google sign-in isn't set up yet.");
   let p;try{p=(await gClient.verifyIdToken({idToken:String(q.body.credential||""),audience:GCID})).getPayload()}catch{throw httpErr(401,"Google sign-in failed. Try again.")}
   if(!p||!p.email||!p.email_verified)throw httpErr(401,"Your Google email isn't verified.");
-  const email=p.email.toLowerCase(),get=()=>db.prepare("SELECT * FROM users WHERE google_id=? OR email=?").get(p.sub,email);
+  const email=p.email.toLowerCase(),get=()=>db.prepare("SELECT * FROM mc_users WHERE google_id=? OR email=?").get(p.sub,email);
   let u=await get();
-  if(!u){await db.prepare("INSERT INTO users(name,phone,pw_hash,verified,created_at,email,google_id) VALUES(?,?,?,1,?,?,?)").run(String(p.name||email.split("@")[0]).slice(0,60),"g:"+p.sub,"!",Date.now(),email,p.sub);u=await get()}
-  else if(!u.google_id||!u.verified){await db.prepare("UPDATE users SET google_id=?,verified=1,email=? WHERE id=?").run(p.sub,email,u.id);u=await get()}
+  if(!u){await db.prepare("INSERT INTO mc_users(name,phone,pw_hash,verified,created_at,email,google_id) VALUES(?,?,?,1,?,?,?)").run(String(p.name||email.split("@")[0]).slice(0,60),"g:"+p.sub,"!",Date.now(),email,p.sub);u=await get()}
+  else if(!u.google_id||!u.verified){await db.prepare("UPDATE mc_users SET google_id=?,verified=1,email=? WHERE id=?").run(p.sub,email,u.id);u=await get()}
   s.json({token:sign(u),name:u.name,email,verified:true,admin:isAdmin(u)});
 }));
 
@@ -311,16 +311,16 @@ const requireVerified=(q,s,n)=>gate(q,s,n).catch(n);
 async function gate(q,s,n){
   const h=q.headers.authorization||"",t=h.startsWith("Bearer ")?h.slice(7).trim():"";
   if(t.startsWith("mc_")){
-    const k=await db.prepare("SELECT k.id AS kid,k.revoked,u.id,u.phone,u.email,u.verified,u.disabled FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=?").get(sha(t));
+    const k=await db.prepare("SELECT k.id AS kid,k.revoked,u.id,u.phone,u.email,u.verified,u.disabled FROM mc_api_keys k JOIN mc_users u ON u.id=k.user_id WHERE k.key_hash=?").get(sha(t));
     if(!k||k.revoked)return fail(s,401,"Invalid API key.");
     if(!k.verified)return fail(s,403,"Verify your mobile number to use the API.");
     if(k.disabled)return fail(s,403,"This account is disabled.");
-    await db.prepare("UPDATE api_keys SET last_used=? WHERE id=?").run(Date.now(),k.kid);
+    await db.prepare("UPDATE mc_api_keys SET last_used=? WHERE id=?").run(Date.now(),k.kid);
     q.user={id:k.id,phone:k.phone,email:k.email,keyId:k.kid,via:"key"};return n();
   }
   let uid;
   try{uid=jwt.verify(t,SECRET,{algorithms:["HS256"]}).sub}catch{return fail(s,401,"Please log in again.")}
-  const u=await db.prepare("SELECT id,phone,email,verified,disabled FROM users WHERE id=?").get(uid);
+  const u=await db.prepare("SELECT id,phone,email,verified,disabled FROM mc_users WHERE id=?").get(uid);
   if(!u||!u.verified)return fail(s,403,"Verify your mobile number to continue.");
   if(u.disabled)return fail(s,403,"This account is disabled.");
   q.user={id:u.id,phone:u.phone,email:u.email,keyId:null,via:"jwt"};n();
@@ -331,8 +331,8 @@ const requireAdmin=(q,s,n)=>requireJwt(q,s,()=>isAdmin(q.user)?n():fail(s,403,"A
 /* ================= API KEYS, USAGE, ADMIN ================= */
 const DEF_Q=+(process.env.DEFAULT_MONTHLY_TOKENS||1000000); // 0 = unlimited
 const monthStart=()=>{const d=new Date();return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),1)};
-const sum=(id,since)=>db.prepare("SELECT COALESCE(SUM(total_tokens),0) AS tokens,COUNT(*) AS requests FROM usage_log WHERE user_id=? AND ts>=?").get(id,since);
-const quotaOf=async id=>{const u=await db.prepare("SELECT monthly_quota AS q FROM users WHERE id=?").get(id);return u&&u.q!=null?u.q:DEF_Q};
+const sum=(id,since)=>db.prepare("SELECT COALESCE(SUM(total_tokens),0) AS tokens,COUNT(*) AS requests FROM mc_usage_log WHERE user_id=? AND ts>=?").get(id,since);
+const quotaOf=async id=>{const u=await db.prepare("SELECT monthly_quota AS q FROM mc_users WHERE id=?").get(id);return u&&u.q!=null?u.q:DEF_Q};
 
 async function checkQuota(id){const q=await quotaOf(id);if(q>0&&(await sum(id,monthStart())).tokens>=q)throw httpErr(429,"Monthly token limit reached. Contact Mohit Corporation to raise it.")}
 const charsOf=ms=>ms.reduce((a,m)=>a+(typeof m.content==="string"?m.content.length:m.content.reduce((b,p)=>b+(p.type==="text"?p.text.length:3000),0)),0);
@@ -340,52 +340,52 @@ const charsOf=ms=>ms.reduce((a,m)=>a+(typeof m.content==="string"?m.content.leng
 async function recordUsage({userId,keyId,source,tier,info,promptChars,outChars}){
   const u=info.usage||{};let pt=+u.prompt_tokens||0,ct=+u.completion_tokens||0,est=0;
   if(!pt&&!ct){pt=Math.ceil(promptChars/4);ct=Math.ceil(outChars/4);est=1}
-  await db.prepare("INSERT INTO usage_log(user_id,key_id,ts,source,tier,provider,model,prompt_tokens,completion_tokens,total_tokens,estimated) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+  await db.prepare("INSERT INTO mc_usage_log(user_id,key_id,ts,source,tier,provider,model,prompt_tokens,completion_tokens,total_tokens,estimated) VALUES(?,?,?,?,?,?,?,?,?,?,?)")
     .run(userId,keyId||null,Date.now(),source,tier,info.provider||null,info.model||null,pt,ct,pt+ct,est);
   return{prompt_tokens:pt,completion_tokens:ct,total_tokens:pt+ct};
 }
 async function usageFor(id,days){
   const since=Date.now()-Math.min(Math.max(+days||30,1),90)*864e5;
   return{
-    days:await db.prepare("SELECT to_char(to_timestamp(ts/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD') AS d,SUM(total_tokens) AS tokens,COUNT(*) AS requests FROM usage_log WHERE user_id=? AND ts>=? GROUP BY 1 ORDER BY 1").all(id,since),
-    keys:await db.prepare("SELECT COALESCE(k.name,'Web chat') AS name,SUM(g.total_tokens) AS tokens,COUNT(*) AS requests FROM usage_log g LEFT JOIN api_keys k ON k.id=g.key_id WHERE g.user_id=? AND g.ts>=? GROUP BY g.key_id,k.name").all(id,since),
+    days:await db.prepare("SELECT to_char(to_timestamp(ts/1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD') AS d,SUM(total_tokens) AS tokens,COUNT(*) AS requests FROM mc_usage_log WHERE user_id=? AND ts>=? GROUP BY 1 ORDER BY 1").all(id,since),
+    keys:await db.prepare("SELECT COALESCE(k.name,'Web chat') AS name,SUM(g.total_tokens) AS tokens,COUNT(*) AS requests FROM mc_usage_log g LEFT JOIN mc_api_keys k ON k.id=g.key_id WHERE g.user_id=? AND g.ts>=? GROUP BY g.key_id,k.name").all(id,since),
     month_tokens:(await sum(id,monthStart())).tokens,quota:await quotaOf(id)};
 }
 
 const api=Router();
 api.get("/me",requireJwt,wrap(async(q,s)=>{
-  const u=await db.prepare("SELECT name,phone,email FROM users WHERE id=?").get(q.user.id);
+  const u=await db.prepare("SELECT name,phone,email FROM mc_users WHERE id=?").get(q.user.id);
   s.json({name:u.name,phone:u.phone,admin:isAdmin(u),month_tokens:(await sum(q.user.id,monthStart())).tokens,quota:await quotaOf(q.user.id)});
 }));
 api.get("/me/usage",requireJwt,wrap(async(q,s)=>s.json(await usageFor(q.user.id,q.query.days))));
 
-api.get("/keys",requireJwt,wrap(async(q,s)=>s.json({keys:await db.prepare("SELECT k.id,k.name,k.prefix,k.created_at,k.last_used,COALESCE((SELECT SUM(total_tokens) FROM usage_log WHERE key_id=k.id),0) AS tokens FROM api_keys k WHERE k.user_id=? AND k.revoked=0 ORDER BY k.id DESC").all(q.user.id)})));
+api.get("/keys",requireJwt,wrap(async(q,s)=>s.json({keys:await db.prepare("SELECT k.id,k.name,k.prefix,k.created_at,k.last_used,COALESCE((SELECT SUM(total_tokens) FROM mc_usage_log WHERE key_id=k.id),0) AS tokens FROM mc_api_keys k WHERE k.user_id=? AND k.revoked=0 ORDER BY k.id DESC").all(q.user.id)})));
 api.post("/keys",requireJwt,wrap(async(q,s)=>{
   const name=String(q.body.name||"").trim().slice(0,40)||"My app";
-  if((await db.prepare("SELECT COUNT(*) AS c FROM api_keys WHERE user_id=? AND revoked=0").get(q.user.id)).c>=10)throw httpErr(400,"You can have up to 10 active keys. Revoke one first.");
+  if((await db.prepare("SELECT COUNT(*) AS c FROM mc_api_keys WHERE user_id=? AND revoked=0").get(q.user.id)).c>=10)throw httpErr(400,"You can have up to 10 active keys. Revoke one first.");
   const key="mc_"+crypto.randomBytes(24).toString("base64url"); // shown once, only the hash is stored
-  const r=await db.prepare("INSERT INTO api_keys(user_id,name,prefix,key_hash,created_at) VALUES(?,?,?,?,?) RETURNING id").get(q.user.id,name,key.slice(0,8),sha(key),Date.now());
+  const r=await db.prepare("INSERT INTO mc_api_keys(user_id,name,prefix,key_hash,created_at) VALUES(?,?,?,?,?) RETURNING id").get(q.user.id,name,key.slice(0,8),sha(key),Date.now());
   s.json({id:r.id,name,prefix:key.slice(0,8),key});
 }));
 api.delete("/keys/:id",requireJwt,wrap(async(q,s)=>{
-  await db.prepare("UPDATE api_keys SET revoked=1 WHERE id=? AND user_id=?").run(+q.params.id,q.user.id);s.json({});
+  await db.prepare("UPDATE mc_api_keys SET revoked=1 WHERE id=? AND user_id=?").run(+q.params.id,q.user.id);s.json({});
 }));
 
 /* ---- Admin: who used how many tokens ---- */
 api.get("/admin/users",requireAdmin,wrap(async(q,s)=>{
   const since=Date.now()-Math.min(Math.max(+q.query.days||30,1),90)*864e5;
   const users=await db.prepare(`SELECT u.id,u.name,u.phone,u.verified,u.disabled,u.monthly_quota,u.created_at,COALESCE(SUM(g.total_tokens),0) AS tokens,COUNT(g.id) AS requests,MAX(g.ts) AS last_active,
-    (SELECT COUNT(*) FROM api_keys k WHERE k.user_id=u.id AND k.revoked=0) AS keys
-    FROM users u LEFT JOIN usage_log g ON g.user_id=u.id AND g.ts>=? GROUP BY u.id ORDER BY tokens DESC LIMIT 500`).all(since);
+    (SELECT COUNT(*) FROM mc_api_keys k WHERE k.user_id=u.id AND k.revoked=0) AS keys
+    FROM mc_users u LEFT JOIN mc_usage_log g ON g.user_id=u.id AND g.ts>=? GROUP BY u.id ORDER BY tokens DESC LIMIT 500`).all(since);
   s.json({users,default_quota:DEF_Q});
 }));
 api.get("/admin/users/:id/usage",requireAdmin,wrap(async(q,s)=>s.json(await usageFor(+q.params.id,q.query.days))));
 api.post("/admin/users/:id/quota",requireAdmin,wrap(async(q,s)=>{
   const v=q.body.monthly_tokens;
-  await db.prepare("UPDATE users SET monthly_quota=? WHERE id=?").run(v==null?null:Math.max(0,Math.floor(+v||0)),+q.params.id);s.json({});
+  await db.prepare("UPDATE mc_users SET monthly_quota=? WHERE id=?").run(v==null?null:Math.max(0,Math.floor(+v||0)),+q.params.id);s.json({});
 }));
 api.post("/admin/users/:id/disable",requireAdmin,wrap(async(q,s)=>{
-  await db.prepare("UPDATE users SET disabled=? WHERE id=?").run(q.body.disabled?1:0,+q.params.id);s.json({});
+  await db.prepare("UPDATE mc_users SET disabled=? WHERE id=?").run(q.body.disabled?1:0,+q.params.id);s.json({});
 }));
 
 /* ================= SERVER + ROUTES ================= */
